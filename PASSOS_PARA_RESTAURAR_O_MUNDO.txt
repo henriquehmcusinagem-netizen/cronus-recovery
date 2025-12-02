@@ -1,0 +1,221 @@
+================================================================================
+                    CRONUS - DISASTER RECOVERY
+              PASSOS PARA RESTAURAR O MUNDO DO ZERO
+================================================================================
+
+Este guia descreve como restaurar TODOS os seus containers, bancos de dados,
+Portainer, stacks e configurações a partir de um backup do Cronus.
+
+Tempo estimado: 10-15 minutos (dependendo do tamanho do backup)
+
+================================================================================
+                         PRÉ-REQUISITOS
+================================================================================
+
+[ ] Máquina nova com Linux instalado (Ubuntu Server 22.04 LTS recomendado)
+[ ] Acesso à internet
+[ ] Arquivo de backup do Cronus (server_backup_XXXXXX.tar.gz)
+[ ] Acesso SSH ou console à máquina
+
+================================================================================
+                      OPÇÃO 1: SETUP AUTOMÁTICO
+                         (RECOMENDADO)
+================================================================================
+
+PASSO 1: Conecte-se à máquina nova via SSH
+--------------------------------------------------------------------------
+    ssh usuario@ip-da-maquina
+
+
+PASSO 2: Execute o script de setup automático
+--------------------------------------------------------------------------
+    curl -fsSL https://raw.githubusercontent.com/henriquehmcusinagem-netizen/cronus-recovery/main/quick-setup.sh | bash
+
+    * Este comando instala automaticamente:
+      - Docker
+      - Docker Compose
+      - Git e jq
+      - Clona o repositório de recovery
+
+
+PASSO 3: Faça logout/login para aplicar permissões do Docker
+--------------------------------------------------------------------------
+    exit
+    ssh usuario@ip-da-maquina
+
+    OU execute: newgrp docker
+
+
+PASSO 4: Copie o arquivo de backup para a máquina
+--------------------------------------------------------------------------
+    # Do seu computador local, execute:
+    scp server_backup_20241201_143052.tar.gz usuario@ip-da-maquina:~/cronus-recovery/
+
+    # OU copie de um pendrive:
+    cp /media/usb/server_backup_*.tar.gz ~/cronus-recovery/
+
+    # OU baixe do S3/MinIO se configurado
+
+
+PASSO 5: Execute a restauração
+--------------------------------------------------------------------------
+    cd ~/cronus-recovery
+    ./restore.sh server_backup_20241201_143052.tar.gz
+
+    * A restauração irá:
+      1. Criar as networks Docker
+      2. Criar e popular os volumes
+      3. Subir todos os containers (Portainer primeiro, depois DBs, depois apps)
+      4. Restaurar os bancos de dados
+
+
+PASSO 6: Verifique se tudo está funcionando
+--------------------------------------------------------------------------
+    docker ps
+
+    # Verificar logs se necessário:
+    docker logs portainer
+    docker logs nome-do-container
+
+
+================================================================================
+                      OPÇÃO 2: SETUP MANUAL
+================================================================================
+
+Se preferir fazer manualmente ou o script automático falhar:
+
+
+PASSO 1: Instalar Docker
+--------------------------------------------------------------------------
+    curl -fsSL https://get.docker.com | sudo sh
+    sudo usermod -aG docker $USER
+    # Fazer logout/login
+
+
+PASSO 2: Instalar dependências
+--------------------------------------------------------------------------
+    # Ubuntu/Debian:
+    sudo apt-get update
+    sudo apt-get install -y jq git
+
+    # CentOS/RHEL:
+    sudo yum install -y jq git
+
+
+PASSO 3: Clonar repositório de recovery
+--------------------------------------------------------------------------
+    git clone https://github.com/henriquehmcusinagem-netizen/cronus-recovery.git
+    cd cronus-recovery
+    chmod +x restore.sh lib/*.sh
+
+
+PASSO 4: Copiar backup e restaurar
+--------------------------------------------------------------------------
+    # Copiar o backup para ~/cronus-recovery/
+    ./restore.sh seu_backup.tar.gz
+
+
+================================================================================
+                    COMANDOS ÚTEIS PÓS-RESTAURAÇÃO
+================================================================================
+
+Ver containers rodando:
+    docker ps
+
+Ver todos os containers (incluindo parados):
+    docker ps -a
+
+Ver logs de um container:
+    docker logs nome-container
+    docker logs -f nome-container  # (seguir em tempo real)
+
+Reiniciar um container:
+    docker restart nome-container
+
+Ver uso de recursos:
+    docker stats
+
+Acessar Portainer:
+    http://ip-da-maquina:9000
+
+Acessar Gitea (se instalado):
+    http://ip-da-maquina:3000
+
+
+================================================================================
+                       OPÇÕES DO RESTORE.SH
+================================================================================
+
+Uso básico:
+    ./restore.sh backup.tar.gz
+
+Ver o que será restaurado (sem executar):
+    ./restore.sh backup.tar.gz --dry-run
+
+Pular restauração de bancos de dados:
+    ./restore.sh backup.tar.gz --skip-databases
+
+Pular criação de networks:
+    ./restore.sh backup.tar.gz --skip-networks
+
+Restaurar apenas um container específico:
+    ./restore.sh backup.tar.gz --container postgres
+
+Ajuda:
+    ./restore.sh --help
+
+
+================================================================================
+                        TROUBLESHOOTING
+================================================================================
+
+PROBLEMA: "permission denied" ao executar docker
+SOLUÇÃO:  Faça logout e login novamente, ou execute: newgrp docker
+
+PROBLEMA: Network já existe
+SOLUÇÃO:  Use --skip-networks ou remova manualmente: docker network rm nome
+
+PROBLEMA: Container não inicia
+SOLUÇÃO:  Verifique logs: docker logs nome-container
+
+PROBLEMA: Banco de dados não restaura
+SOLUÇÃO:  Aguarde o container estar 100% pronto e tente manual:
+          - PostgreSQL: docker exec -i postgres pg_restore -U postgres -d postgres < dump.dump
+          - MySQL: docker exec -i mysql mysql -u root < dump.sql
+
+PROBLEMA: Porta já em uso
+SOLUÇÃO:  Verifique: sudo netstat -tlnp | grep PORTA
+          Mate o processo ou altere a porta no docker-compose.yml
+
+
+================================================================================
+                         INFORMAÇÕES
+================================================================================
+
+Repositório de Recovery:
+    https://github.com/henriquehmcusinagem-netizen/cronus-recovery
+
+Projeto Cronus:
+    Sistema de backup de containers Docker
+
+Ordem de Boot (prioridade):
+    5  - Infraestrutura (Portainer, Gitea)
+    10 - Bancos de dados (PostgreSQL, MySQL, MongoDB)
+    20 - Caches (Redis)
+    30 - Filas (RabbitMQ, Kafka)
+    50 - Aplicações
+    90 - Reverse Proxies (Nginx, Traefik)
+
+
+================================================================================
+                    RESUMO RÁPIDO (COLA AQUI!)
+================================================================================
+
+    1. ssh usuario@servidor-novo
+    2. curl -fsSL https://raw.githubusercontent.com/henriquehmcusinagem-netizen/cronus-recovery/main/quick-setup.sh | bash
+    3. exit && ssh usuario@servidor-novo
+    4. scp backup.tar.gz para ~/cronus-recovery/
+    5. cd ~/cronus-recovery && ./restore.sh backup.tar.gz
+    6. docker ps (verificar)
+
+================================================================================
