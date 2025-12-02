@@ -147,7 +147,15 @@ main() {
 
     if [[ "$DRY_RUN" == "true" ]]; then
         warn "[DRY RUN] Would restore the following:"
-        jq -r '.containers[] | "  - \(.container_name) (\(.image))"' "$MANIFEST_FILE"
+        echo ""
+        echo "Boot order (infrastructure and databases first):"
+        jq -r '.restoration.boot_order[]? // empty' "$MANIFEST_FILE" | nl
+        echo ""
+        echo "Containers:"
+        jq -r '.containers | sort_by(.boot_priority) | .[] | "  [\(.boot_priority)] \(.container_name) (\(.image))"' "$MANIFEST_FILE"
+        echo ""
+        echo "Networks:"
+        jq -r '.networks[]? | "  - \(.name) (\(.driver))"' "$MANIFEST_FILE"
         exit 0
     fi
 
