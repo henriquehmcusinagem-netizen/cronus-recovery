@@ -177,7 +177,12 @@ main() {
         if [[ -f "$COMPOSE_FILE" ]]; then
             log "Starting containers with docker-compose..."
             cd "$TEMP_DIR"
-            docker-compose up -d
+            # Try new docker compose first, fallback to old docker-compose
+            if docker compose version &> /dev/null; then
+                docker compose up -d
+            else
+                docker-compose up -d
+            fi
             cd - > /dev/null
         else
             warn "docker-compose.yml not found, skipping container startup"
