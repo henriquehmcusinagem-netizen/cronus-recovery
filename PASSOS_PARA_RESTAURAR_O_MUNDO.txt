@@ -12,138 +12,201 @@ Tempo estimado: 10-15 minutos (dependendo do tamanho do backup)
                          PRÉ-REQUISITOS
 ================================================================================
 
-[ ] Máquina nova com Linux instalado (Ubuntu Server 22.04 LTS recomendado)
-[ ] Acesso à internet
 [ ] Arquivo de backup do Cronus (server_backup_XXXXXX.tar.gz)
-[ ] Acesso SSH ou console à máquina
+[ ] Pendrive, HD externo ou acesso ao S3/storage onde está o backup
+[ ] Acesso à internet para baixar Docker e dependências
 
 ================================================================================
-                      OPÇÃO 1: SETUP AUTOMÁTICO
-                         (RECOMENDADO)
+               PASSO 1: INSTALAR SISTEMA OPERACIONAL
 ================================================================================
 
-PASSO 1: Conecte-se à máquina nova via SSH
---------------------------------------------------------------------------
-    ssh usuario@ip-da-maquina
+SISTEMA RECOMENDADO: Debian 12 (Bookworm)
+
+Download ISO:
+    https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-12.8.0-amd64-netinst.iso
+
+Alternativa - Link direto para download:
+    https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/
+
+Durante a instalação do Debian:
+    - Selecione idioma e teclado
+    - Configure rede (DHCP ou IP fixo)
+    - Crie usuário (ex: admin)
+    - Na seleção de software, marque APENAS:
+        [x] SSH server
+        [x] Standard system utilities
+    - NÃO instale interface gráfica (desnecessário para servidor)
+
+Após instalação, conecte via SSH:
+    ssh usuario@ip-do-servidor
 
 
-PASSO 2: Execute o script de setup automático
---------------------------------------------------------------------------
+================================================================================
+               PASSO 2: SETUP AUTOMÁTICO (RECOMENDADO)
+================================================================================
+
+Execute este comando único que instala tudo automaticamente:
+
     curl -fsSL https://raw.githubusercontent.com/henriquehmcusinagem-netizen/cronus-recovery/main/quick-setup.sh | bash
 
-    * Este comando instala automaticamente:
-      - Docker
-      - Docker Compose
-      - Git e jq
-      - Clona o repositório de recovery
+Este comando:
+    ✓ Instala Docker
+    ✓ Instala Docker Compose
+    ✓ Instala Git e jq
+    ✓ Clona o repositório de recovery
+    ✓ Configura permissões
 
-
-PASSO 3: Faça logout/login para aplicar permissões do Docker
---------------------------------------------------------------------------
+Após executar, faça logout e login novamente:
     exit
-    ssh usuario@ip-da-maquina
-
-    OU execute: newgrp docker
-
-
-PASSO 4: Copie o arquivo de backup para a máquina
---------------------------------------------------------------------------
-    # Do seu computador local, execute:
-    scp server_backup_20241201_143052.tar.gz usuario@ip-da-maquina:~/cronus-recovery/
-
-    # OU copie de um pendrive:
-    cp /media/usb/server_backup_*.tar.gz ~/cronus-recovery/
-
-    # OU baixe do S3/MinIO se configurado
-
-
-PASSO 5: Execute a restauração
---------------------------------------------------------------------------
-    cd ~/cronus-recovery
-    ./restore.sh server_backup_20241201_143052.tar.gz
-
-    * A restauração irá:
-      1. Criar as networks Docker
-      2. Criar e popular os volumes
-      3. Subir todos os containers (Portainer primeiro, depois DBs, depois apps)
-      4. Restaurar os bancos de dados
-
-
-PASSO 6: Verifique se tudo está funcionando
---------------------------------------------------------------------------
-    docker ps
-
-    # Verificar logs se necessário:
-    docker logs portainer
-    docker logs nome-do-container
+    ssh usuario@ip-do-servidor
 
 
 ================================================================================
-                      OPÇÃO 2: SETUP MANUAL
+               PASSO 2 ALTERNATIVO: SETUP MANUAL
+          (Use apenas se o setup automático falhar)
 ================================================================================
 
-Se preferir fazer manualmente ou o script automático falhar:
+Se o quick-setup.sh falhar, siga estes passos manualmente:
 
-
-PASSO 1: Instalar Docker
+2.1 - Atualizar sistema:
 --------------------------------------------------------------------------
-    curl -fsSL https://get.docker.com | sudo sh
+    sudo apt update && sudo apt upgrade -y
+
+
+2.2 - Instalar dependências:
+--------------------------------------------------------------------------
+    sudo apt install -y curl git jq ca-certificates gnupg
+
+
+2.3 - Instalar Docker (método oficial):
+--------------------------------------------------------------------------
+    # Adicionar chave GPG do Docker
+    sudo install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+    # Adicionar repositório
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
+      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+      sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+    # Instalar Docker
+    sudo apt update
+    sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+    # Adicionar usuário ao grupo docker
     sudo usermod -aG docker $USER
+
     # Fazer logout/login
+    exit
+    ssh usuario@ip-do-servidor
 
 
-PASSO 2: Instalar dependências
+2.4 - Verificar instalação do Docker:
 --------------------------------------------------------------------------
-    # Ubuntu/Debian:
-    sudo apt-get update
-    sudo apt-get install -y jq git
-
-    # CentOS/RHEL:
-    sudo yum install -y jq git
+    docker --version
+    docker compose version
 
 
-PASSO 3: Clonar repositório de recovery
+2.5 - Clonar repositório de recovery:
 --------------------------------------------------------------------------
     git clone https://github.com/henriquehmcusinagem-netizen/cronus-recovery.git
     cd cronus-recovery
     chmod +x restore.sh lib/*.sh
 
 
-PASSO 4: Copiar backup e restaurar
+================================================================================
+               PASSO 3: COPIAR BACKUP PARA O SERVIDOR
+================================================================================
+
+OPÇÃO A - Via SCP (do seu computador):
 --------------------------------------------------------------------------
-    # Copiar o backup para ~/cronus-recovery/
-    ./restore.sh seu_backup.tar.gz
+    scp /caminho/server_backup_20241201_143052.tar.gz usuario@ip-do-servidor:~/cronus-recovery/
+
+
+OPÇÃO B - Via pendrive/HD externo:
+--------------------------------------------------------------------------
+    # Identificar o dispositivo
+    lsblk
+
+    # Montar (geralmente /dev/sdb1)
+    sudo mkdir -p /mnt/usb
+    sudo mount /dev/sdb1 /mnt/usb
+
+    # Copiar
+    cp /mnt/usb/server_backup_*.tar.gz ~/cronus-recovery/
+
+    # Desmontar
+    sudo umount /mnt/usb
+
+
+OPÇÃO C - Via wget (se estiver em um servidor web):
+--------------------------------------------------------------------------
+    cd ~/cronus-recovery
+    wget http://seu-servidor/backups/server_backup_20241201_143052.tar.gz
 
 
 ================================================================================
-                    COMANDOS ÚTEIS PÓS-RESTAURAÇÃO
+               PASSO 4: EXECUTAR RESTAURAÇÃO
 ================================================================================
 
-Ver containers rodando:
+4.1 - Entrar no diretório:
+--------------------------------------------------------------------------
+    cd ~/cronus-recovery
+
+
+4.2 - (Opcional) Ver o que será restaurado:
+--------------------------------------------------------------------------
+    ./restore.sh server_backup_20241201_143052.tar.gz --dry-run
+
+    Isso mostra:
+    - Ordem de boot dos containers
+    - Lista de containers
+    - Networks que serão criadas
+
+
+4.3 - Executar restauração completa:
+--------------------------------------------------------------------------
+    ./restore.sh server_backup_20241201_143052.tar.gz
+
+    O script irá:
+    1. Extrair o backup
+    2. Criar as networks Docker
+    3. Criar e popular os volumes com dados
+    4. Gerar docker-compose.yml
+    5. Subir containers na ordem correta:
+       - Portainer, Gitea (infra) → primeiro
+       - PostgreSQL, MySQL (bancos) → segundo
+       - Aplicações → terceiro
+       - Nginx, Traefik (proxies) → por último
+    6. Restaurar dumps dos bancos de dados
+
+
+================================================================================
+               PASSO 5: VERIFICAR SE TUDO FUNCIONOU
+================================================================================
+
+5.1 - Ver containers rodando:
+--------------------------------------------------------------------------
     docker ps
 
-Ver todos os containers (incluindo parados):
-    docker ps -a
 
-Ver logs de um container:
-    docker logs nome-container
-    docker logs -f nome-container  # (seguir em tempo real)
+5.2 - Ver logs de um container específico:
+--------------------------------------------------------------------------
+    docker logs portainer
+    docker logs gitea
+    docker logs nome-do-container
 
-Reiniciar um container:
-    docker restart nome-container
 
-Ver uso de recursos:
-    docker stats
-
-Acessar Portainer:
-    http://ip-da-maquina:9000
-
-Acessar Gitea (se instalado):
-    http://ip-da-maquina:3000
+5.3 - Acessar serviços (ajuste o IP):
+--------------------------------------------------------------------------
+    Portainer:  http://IP-DO-SERVIDOR:9000
+    Gitea:      http://IP-DO-SERVIDOR:3000
 
 
 ================================================================================
-                       OPÇÕES DO RESTORE.SH
+                    OPÇÕES DO RESTORE.SH
 ================================================================================
 
 Uso básico:
@@ -158,6 +221,9 @@ Pular restauração de bancos de dados:
 Pular criação de networks:
     ./restore.sh backup.tar.gz --skip-networks
 
+Não subir containers (só restaurar dados):
+    ./restore.sh backup.tar.gz --skip-compose
+
 Restaurar apenas um container específico:
     ./restore.sh backup.tar.gz --container postgres
 
@@ -166,26 +232,119 @@ Ajuda:
 
 
 ================================================================================
-                        TROUBLESHOOTING
+                       TROUBLESHOOTING
 ================================================================================
 
 PROBLEMA: "permission denied" ao executar docker
-SOLUÇÃO:  Faça logout e login novamente, ou execute: newgrp docker
+--------------------------------------------------------------------------
+CAUSA:    Usuário não está no grupo docker
+SOLUÇÃO:
+    sudo usermod -aG docker $USER
+    exit
+    # Conectar novamente via SSH
 
-PROBLEMA: Network já existe
-SOLUÇÃO:  Use --skip-networks ou remova manualmente: docker network rm nome
+
+PROBLEMA: "command not found: docker"
+--------------------------------------------------------------------------
+CAUSA:    Docker não instalado corretamente
+SOLUÇÃO:  Seguir passo 2 alternativo (setup manual)
+
+
+PROBLEMA: "Network já existe"
+--------------------------------------------------------------------------
+CAUSA:    Redes de uma instalação anterior
+SOLUÇÃO:
+    # Listar networks
+    docker network ls
+
+    # Remover (se não estiver em uso)
+    docker network rm nome_da_network
+
+    # Ou usar flag --skip-networks
+    ./restore.sh backup.tar.gz --skip-networks
+
 
 PROBLEMA: Container não inicia
-SOLUÇÃO:  Verifique logs: docker logs nome-container
+--------------------------------------------------------------------------
+CAUSA:    Diversas possíveis
+SOLUÇÃO:
+    # Ver logs detalhados
+    docker logs nome-container
 
-PROBLEMA: Banco de dados não restaura
-SOLUÇÃO:  Aguarde o container estar 100% pronto e tente manual:
-          - PostgreSQL: docker exec -i postgres pg_restore -U postgres -d postgres < dump.dump
-          - MySQL: docker exec -i mysql mysql -u root < dump.sql
+    # Ver eventos
+    docker events
 
-PROBLEMA: Porta já em uso
-SOLUÇÃO:  Verifique: sudo netstat -tlnp | grep PORTA
-          Mate o processo ou altere a porta no docker-compose.yml
+
+PROBLEMA: Banco de dados não restaura automaticamente
+--------------------------------------------------------------------------
+CAUSA:    Container pode não estar totalmente pronto
+SOLUÇÃO:  Restaurar manualmente:
+
+    # PostgreSQL:
+    docker exec -i nome-postgres pg_restore -U postgres -d postgres -c < dump.dump
+
+    # MySQL:
+    docker exec -i nome-mysql mysql -u root -p < dump.sql
+
+    # MongoDB:
+    docker exec -i nome-mongo mongorestore --archive < dump.archive
+
+
+PROBLEMA: "Porta já em uso"
+--------------------------------------------------------------------------
+CAUSA:    Outro serviço usando a porta
+SOLUÇÃO:
+    # Ver o que está usando a porta (ex: 9000)
+    sudo ss -tlnp | grep 9000
+
+    # Matar processo ou mudar porta no docker-compose.yml
+
+
+PROBLEMA: "No space left on device"
+--------------------------------------------------------------------------
+CAUSA:    Disco cheio
+SOLUÇÃO:
+    # Ver espaço
+    df -h
+
+    # Limpar Docker (CUIDADO - remove dados não usados)
+    docker system prune -a
+
+
+================================================================================
+                    COMANDOS ÚTEIS PÓS-RESTAURAÇÃO
+================================================================================
+
+Ver containers rodando:
+    docker ps
+
+Ver todos containers (incluindo parados):
+    docker ps -a
+
+Logs em tempo real:
+    docker logs -f nome-container
+
+Reiniciar container:
+    docker restart nome-container
+
+Parar container:
+    docker stop nome-container
+
+Iniciar container:
+    docker start nome-container
+
+Ver uso de recursos:
+    docker stats
+
+Entrar em um container:
+    docker exec -it nome-container /bin/bash
+    docker exec -it nome-container /bin/sh  # (Alpine)
+
+Listar volumes:
+    docker volume ls
+
+Listar networks:
+    docker network ls
 
 
 ================================================================================
@@ -195,27 +354,103 @@ SOLUÇÃO:  Verifique: sudo netstat -tlnp | grep PORTA
 Repositório de Recovery:
     https://github.com/henriquehmcusinagem-netizen/cronus-recovery
 
-Projeto Cronus:
-    Sistema de backup de containers Docker
+Quick Setup Script:
+    https://raw.githubusercontent.com/henriquehmcusinagem-netizen/cronus-recovery/main/quick-setup.sh
 
-Ordem de Boot (prioridade):
-    5  - Infraestrutura (Portainer, Gitea)
-    10 - Bancos de dados (PostgreSQL, MySQL, MongoDB)
-    20 - Caches (Redis)
-    30 - Filas (RabbitMQ, Kafka)
-    50 - Aplicações
-    90 - Reverse Proxies (Nginx, Traefik)
+Debian 12 ISO:
+    https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-12.8.0-amd64-netinst.iso
+
+Docker Docs:
+    https://docs.docker.com/engine/install/debian/
+
+Ordem de Boot dos Containers:
+    Prioridade 5  - Infraestrutura (Portainer, Gitea, Ducks)
+    Prioridade 10 - Bancos de dados (PostgreSQL, MySQL, MongoDB)
+    Prioridade 20 - Caches (Redis, Memcached)
+    Prioridade 30 - Filas (RabbitMQ, Kafka)
+    Prioridade 50 - Aplicações (default)
+    Prioridade 90 - Reverse Proxies (Nginx, Traefik)
 
 
 ================================================================================
-                    RESUMO RÁPIDO (COLA AQUI!)
+               QUICK-SETUP.SH - CÓDIGO COMPLETO
+        (Copie e salve como quick-setup.sh se não conseguir baixar)
 ================================================================================
 
-    1. ssh usuario@servidor-novo
-    2. curl -fsSL https://raw.githubusercontent.com/henriquehmcusinagem-netizen/cronus-recovery/main/quick-setup.sh | bash
-    3. exit && ssh usuario@servidor-novo
-    4. scp backup.tar.gz para ~/cronus-recovery/
-    5. cd ~/cronus-recovery && ./restore.sh backup.tar.gz
-    6. docker ps (verificar)
+#!/bin/bash
+set -e
+
+echo "=== CRONUS RECOVERY - QUICK SETUP ==="
+
+# Detectar OS
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS=$ID
+fi
+
+# Instalar Docker
+if ! command -v docker &> /dev/null; then
+    echo "[1/4] Instalando Docker..."
+    curl -fsSL https://get.docker.com | sudo sh
+    sudo usermod -aG docker $USER
+else
+    echo "[1/4] Docker já instalado"
+fi
+
+# Instalar dependências
+echo "[2/4] Instalando dependências..."
+sudo apt-get update -qq
+sudo apt-get install -y -qq jq git curl
+
+# Clonar repositório
+echo "[3/4] Clonando repositório..."
+INSTALL_DIR="$HOME/cronus-recovery"
+if [ -d "$INSTALL_DIR" ]; then
+    cd "$INSTALL_DIR" && git pull
+else
+    git clone https://github.com/henriquehmcusinagem-netizen/cronus-recovery.git "$INSTALL_DIR"
+fi
+
+# Permissões
+echo "[4/4] Configurando permissões..."
+cd "$INSTALL_DIR"
+chmod +x restore.sh lib/*.sh
+
+echo ""
+echo "=== SETUP COMPLETO ==="
+echo ""
+echo "PRÓXIMOS PASSOS:"
+echo "  1. Faça logout/login: exit && ssh usuario@servidor"
+echo "  2. Copie o backup: scp backup.tar.gz usuario@servidor:~/cronus-recovery/"
+echo "  3. Restaure: cd ~/cronus-recovery && ./restore.sh backup.tar.gz"
+echo ""
+
+
+================================================================================
+                    RESUMO RÁPIDO - COLA AQUI!
+================================================================================
+
+# 1. Instalar Debian 12 (só SSH server)
+#    ISO: https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/
+
+# 2. Conectar via SSH
+ssh usuario@ip-do-servidor
+
+# 3. Setup automático
+curl -fsSL https://raw.githubusercontent.com/henriquehmcusinagem-netizen/cronus-recovery/main/quick-setup.sh | bash
+
+# 4. Relogar
+exit
+ssh usuario@ip-do-servidor
+
+# 5. Copiar backup (do seu PC)
+scp backup.tar.gz usuario@ip-do-servidor:~/cronus-recovery/
+
+# 6. Restaurar
+cd ~/cronus-recovery
+./restore.sh backup.tar.gz
+
+# 7. Verificar
+docker ps
 
 ================================================================================
