@@ -90,11 +90,33 @@ install_docker_compose() {
     echo -e "${BLUE}[2/4]${NC} Verificando Docker Compose..."
 
     if docker compose version &> /dev/null; then
-        echo -e "${GREEN}[OK]${NC} Docker Compose já está instalado"
+        echo -e "${GREEN}[OK]${NC} Docker Compose já está instalado: $(docker compose version)"
     elif command -v docker-compose &> /dev/null; then
         echo -e "${GREEN}[OK]${NC} docker-compose já está instalado: $(docker-compose --version)"
     else
-        echo -e "${BLUE}[INFO]${NC} Docker Compose V2 já incluído no Docker Engine moderno"
+        echo -e "${BLUE}[INFO]${NC} Instalando Docker Compose plugin..."
+        case $OS in
+            ubuntu|debian)
+                $SUDO apt-get update -qq
+                $SUDO apt-get install -y -qq docker-compose-plugin
+                ;;
+            centos|rhel|fedora)
+                $SUDO yum install -y -q docker-compose-plugin
+                ;;
+            alpine)
+                $SUDO apk add --no-cache docker-compose
+                ;;
+            *)
+                echo -e "${YELLOW}[WARN]${NC} Instalando via pip..."
+                $SUDO pip3 install docker-compose || true
+                ;;
+        esac
+
+        if docker compose version &> /dev/null; then
+            echo -e "${GREEN}[OK]${NC} Docker Compose instalado: $(docker compose version)"
+        else
+            echo -e "${RED}[ERROR]${NC} Falha ao instalar Docker Compose. Instale manualmente."
+        fi
     fi
 }
 
