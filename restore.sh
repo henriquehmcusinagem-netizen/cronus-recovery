@@ -199,21 +199,8 @@ main() {
     # Step 4: Start containers
     if [[ "$SKIP_COMPOSE" != "true" ]]; then
         if [[ "$PORTAINER_INCLUDED" == "true" ]] && [[ "$SKIP_PORTAINER" != "true" ]]; then
-            echo ""
-            log "============================================"
-            log "   REDEPLOY STACKS IN PORTAINER"
-            log "============================================"
-            echo ""
-            log "Portainer has been restored with all your stacks."
-            log "Please go to Portainer UI and redeploy each stack:"
-            echo ""
-            echo "  1. Access https://localhost:9443 (or your server IP)"
-            echo "  2. Go to Stacks menu"
-            echo "  3. For each stack: click Update the stack"
-            echo ""
-            echo "This will start all containers using the restored volumes."
-            echo ""
-            read -p "Press Enter after you have redeployed all stacks..."
+            # Auto-redeploy all stacks via Portainer API
+            redeploy_portainer_stacks "https://localhost:9443"
         else
             COMPOSE_FILE="$TEMP_DIR/docker-compose.yml"
             if [[ -f "$COMPOSE_FILE" ]]; then

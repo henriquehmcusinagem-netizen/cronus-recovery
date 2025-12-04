@@ -99,11 +99,157 @@ restore_portainer() {
     return 0
 }
 
+# Get Portainer JWT token
+portainer_authenticate() {
+    local portainer_url=$1
+    local username=$2
+    local password=$3
+
+    local response=$(curl -sk -X POST "${portainer_url}/api/auth" \
+        -H "Content-Type: application/json" \
+        -d "{\"username\":\"${username}\",\"password\":\"${password}\"}" 2>/dev/null)
+
+    echo "$response" | jq -r '.jwt // empty' 2>/dev/null
+}
+
+# Get endpoint ID (usually 1 for local Docker)
+portainer_get_endpoint_id() {
+    local portainer_url=$1
+    local token=$2
+
+    local response=$(curl -sk -X GET "${portainer_url}/api/endpoints" \
+        -H "Authorization: Bearer ${token}" 2>/dev/null)
+
+    echo "$response" | jq -r '.[0].Id // empty' 2>/dev/null
+}
+
+# List all stacks
+portainer_list_stacks() {
+    local portainer_url=$1
+    local token=$2
+
+    curl -sk -X GET "${portainer_url}/api/stacks" \
+        -H "Authorization: Bearer ${token}" 2>/dev/null
+}
+
+# Redeploy a single stack
+portainer_redeploy_stack() {
+    local portainer_url=$1
+    local token=$2
+    local stack_id=$3
+    local endpoint_id=$4
+
+    # Get stack details first
+    local stack_info=$(curl -sk -X GET "${portainer_url}/api/stacks/${stack_id}" \
+        -H "Authorization: Bearer ${token}" 2>/dev/null)
+
+    local stack_name=$(echo "$stack_info" | jq -r '.Name // empty')
+    local env_vars=$(echo "$stack_info" | jq -c '.Env // []')
+
+    # Get stack file content
+    local stack_file=$(curl -sk -X GET "${portainer_url}/api/stacks/${stack_id}/file" \
+        -H "Authorization: Bearer ${token}" 2>/dev/null | jq -r '.StackFileContent // empty')
+
+    if [[ -z "$stack_file" ]]; then
+        warn "Could not get stack file for stack $stack_id"
+        return 1
+    fi
+
+    # Redeploy stack
+    local response=$(curl -sk -X PUT "${portainer_url}/api/stacks/${stack_id}?endpointId=${endpoint_id}" \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" \
+        -d "{\"stackFileContent\":$(echo "$stack_file" | jq -Rs .),\"env\":${env_vars},\"prune\":false}" 2>/dev/null)
+
+    local error=$(echo "$response" | jq -r '.message // empty' 2>/dev/null)
+    if [[ -n "$error" ]]; then
+        warn "Failed to redeploy $stack_name: $error"
+        return 1
+    fi
+
+    return 0
+}
+
 # Redeploy all stacks in Portainer (via API)
 redeploy_portainer_stacks() {
     local portainer_url=${1:-"https://localhost:9443"}
 
-    warn "Stack redeploy via API requires authentication"
-    log "Please manually redeploy stacks via Portainer UI at: $portainer_url"
-    log "Go to Stacks -> Select each stack -> Update the stack"
+    echo ""
+    log "============================================"
+    log "   AUTO-REDEPLOY STACKS"
+    log "============================================"
+    echo ""
+    log "To automatically redeploy all stacks, enter your Portainer credentials."
+    echo ""
+
+    # Ask for credentials
+    read -p "Portainer username: " PORTAINER_USER
+    read -sp "Portainer password: " PORTAINER_PASS
+    echo ""
+
+    if [[ -z "$PORTAINER_USER" ]] || [[ -z "$PORTAINER_PASS" ]]; then
+        warn "No credentials provided, skipping auto-redeploy"
+        log "You can manually redeploy stacks at: $portainer_url"
+        return 1
+    fi
+
+    # Authenticate
+    log "Authenticating with Portainer..."
+    local token=$(portainer_authenticate "$portainer_url" "$PORTAINER_USER" "$PORTAINER_PASS")
+
+    if [[ -z "$token" ]]; then
+        error "Authentication failed. Check your credentials."
+        log "You can manually redeploy stacks at: $portainer_url"
+        return 1
+    fi
+
+    success "Authenticated successfully"
+
+    # Get endpoint ID
+    local endpoint_id=$(portainer_get_endpoint_id "$portainer_url" "$token")
+    if [[ -z "$endpoint_id" ]]; then
+        error "Could not get endpoint ID"
+        return 1
+    fi
+
+    # List stacks
+    log "Fetching stacks..."
+    local stacks=$(portainer_list_stacks "$portainer_url" "$token")
+    local stack_count=$(echo "$stacks" | jq 'length' 2>/dev/null)
+
+    if [[ -z "$stack_count" ]] || [[ "$stack_count" == "0" ]]; then
+        warn "No stacks found to redeploy"
+        return 0
+    fi
+
+    log "Found $stack_count stack(s) to redeploy"
+    echo ""
+
+    # Redeploy each stack
+    local success_count=0
+    local fail_count=0
+
+    for stack_id in $(echo "$stacks" | jq -r '.[].Id'); do
+        local stack_name=$(echo "$stacks" | jq -r ".[] | select(.Id==$stack_id) | .Name")
+        log "Redeploying: $stack_name..."
+
+        if portainer_redeploy_stack "$portainer_url" "$token" "$stack_id" "$endpoint_id"; then
+            success "  $stack_name redeployed"
+            ((success_count++))
+        else
+            ((fail_count++))
+        fi
+
+        # Small delay between deployments
+        sleep 2
+    done
+
+    echo ""
+    log "Redeploy complete: $success_count succeeded, $fail_count failed"
+
+    if [[ $fail_count -gt 0 ]]; then
+        warn "Some stacks failed. Check Portainer UI: $portainer_url"
+    fi
+
+    return 0
 }
