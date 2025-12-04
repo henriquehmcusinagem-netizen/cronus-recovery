@@ -217,7 +217,12 @@ create_stack_networks() {
         # Check if network exists
         if ! docker network inspect "$full_network_name" &>/dev/null; then
             log "  Creating network: $full_network_name"
-            docker network create "$full_network_name" &>/dev/null || true
+            # Create with docker-compose labels so Portainer recognizes it
+            docker network create \
+                --label "com.docker.compose.network=${network}" \
+                --label "com.docker.compose.project=${stack_name}" \
+                --label "com.docker.compose.version=2.21.0" \
+                "$full_network_name" &>/dev/null || true
         fi
     done
 }
