@@ -170,6 +170,109 @@ portainer_redeploy_stack() {
     return 0
 }
 
+# Priority order for stack deployment
+# 1st: alexandria (base infrastructure)
+# 2nd: ducks-ecosystem (depends on alexandria)
+# 3rd: argos (secrets manager)
+# Rest: no specific order
+STACK_PRIORITY_ORDER=("alexandria" "ducks-ecosystem" "argos")
+
+# Get stack priority (lower = higher priority)
+get_stack_priority() {
+    local stack_name=$1
+    local priority=999
+
+    for i in "${!STACK_PRIORITY_ORDER[@]}"; do
+        if [[ "${STACK_PRIORITY_ORDER[$i]}" == "$stack_name" ]]; then
+            priority=$i
+            break
+        fi
+    done
+
+    echo $priority
+}
+
+# Create networks for a stack before deploying
+create_stack_networks() {
+    local portainer_url=$1
+    local token=$2
+    local stack_id=$3
+    local stack_name=$4
+
+    # Get stack file content
+    local stack_file=$(curl -sk -X GET "${portainer_url}/api/stacks/${stack_id}/file" \
+        -H "Authorization: Bearer ${token}" 2>/dev/null | jq -r '.StackFileContent // empty')
+
+    if [[ -z "$stack_file" ]]; then
+        return 0
+    fi
+
+    # Extract network names from the stack file
+    # Look for networks defined in the file
+    local networks=$(echo "$stack_file" | grep -E "^\s+[a-zA-Z0-9_-]+-network:" | sed 's/://g' | awk '{print $1}')
+
+    for network in $networks; do
+        local full_network_name="${stack_name}_${network}"
+
+        # Check if network exists
+        if ! docker network inspect "$full_network_name" &>/dev/null; then
+            log "  Creating network: $full_network_name"
+            docker network create "$full_network_name" &>/dev/null || true
+        fi
+    done
+}
+
+# Create all required networks before deployment
+create_all_stack_networks() {
+    local portainer_url=$1
+    local token=$2
+    local stacks=$3
+
+    log "Pre-creating Docker networks for all stacks..."
+    echo ""
+
+    for stack_id in $(echo "$stacks" | jq -r '.[].Id'); do
+        local stack_name=$(echo "$stacks" | jq -r ".[] | select(.Id==$stack_id) | .Name")
+        create_stack_networks "$portainer_url" "$token" "$stack_id" "$stack_name"
+    done
+
+    success "Networks created"
+    echo ""
+}
+
+# Sort stacks by priority
+sort_stacks_by_priority() {
+    local stacks=$1
+    local sorted_ids=""
+
+    # First, add priority stacks in order
+    for priority_name in "${STACK_PRIORITY_ORDER[@]}"; do
+        local stack_id=$(echo "$stacks" | jq -r ".[] | select(.Name==\"$priority_name\") | .Id")
+        if [[ -n "$stack_id" ]]; then
+            sorted_ids="$sorted_ids $stack_id"
+        fi
+    done
+
+    # Then add the rest
+    for stack_id in $(echo "$stacks" | jq -r '.[].Id'); do
+        local stack_name=$(echo "$stacks" | jq -r ".[] | select(.Id==$stack_id) | .Name")
+        local is_priority=false
+
+        for priority_name in "${STACK_PRIORITY_ORDER[@]}"; do
+            if [[ "$stack_name" == "$priority_name" ]]; then
+                is_priority=true
+                break
+            fi
+        done
+
+        if [[ "$is_priority" == "false" ]]; then
+            sorted_ids="$sorted_ids $stack_id"
+        fi
+    done
+
+    echo $sorted_ids
+}
+
 # Redeploy all stacks in Portainer (via API)
 redeploy_portainer_stacks() {
     local portainer_url=${1:-"https://localhost:9443"}
@@ -225,11 +328,20 @@ redeploy_portainer_stacks() {
     log "Found $stack_count stack(s) to redeploy"
     echo ""
 
-    # Redeploy each stack
+    # Step 1: Create all networks first
+    create_all_stack_networks "$portainer_url" "$token" "$stacks"
+
+    # Step 2: Sort stacks by priority
+    log "Deploy order: alexandria -> ducks-ecosystem -> argos -> others"
+    echo ""
+
+    local sorted_stack_ids=$(sort_stacks_by_priority "$stacks")
+
+    # Step 3: Redeploy each stack in order
     local success_count=0
     local fail_count=0
 
-    for stack_id in $(echo "$stacks" | jq -r '.[].Id'); do
+    for stack_id in $sorted_stack_ids; do
         local stack_name=$(echo "$stacks" | jq -r ".[] | select(.Id==$stack_id) | .Name")
         log "Redeploying: $stack_name..."
 
@@ -240,8 +352,8 @@ redeploy_portainer_stacks() {
             ((fail_count++))
         fi
 
-        # Small delay between deployments
-        sleep 2
+        # Wait for containers to start before next deployment
+        sleep 5
     done
 
     echo ""
