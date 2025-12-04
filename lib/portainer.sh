@@ -352,9 +352,9 @@ redeploy_portainer_stacks() {
 
         if portainer_redeploy_stack "$portainer_url" "$token" "$stack_id" "$endpoint_id"; then
             success "  $stack_name redeployed"
-            ((success_count++))
+            success_count=$((success_count + 1))
         else
-            ((fail_count++))
+            fail_count=$((fail_count + 1))
         fi
 
         # Wait for containers to start before next deployment
