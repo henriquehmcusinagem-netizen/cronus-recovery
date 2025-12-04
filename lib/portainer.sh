@@ -203,24 +203,6 @@ create_stack_networks() {
     done
 }
 
-# Create all required networks before deployment
-create_all_stack_networks() {
-    local portainer_url=$1
-    local token=$2
-    local stacks=$3
-
-    log "Pre-creating Docker networks for all stacks..."
-    echo ""
-
-    for stack_id in $(echo "$stacks" | jq -r '.[].Id'); do
-        local stack_name=$(echo "$stacks" | jq -r ".[] | select(.Id==$stack_id) | .Name")
-        create_stack_networks "$portainer_url" "$token" "$stack_id" "$stack_name"
-    done
-
-    success "Networks created"
-    echo ""
-}
-
 # Wait for PostgreSQL container to be healthy
 wait_for_postgres_healthy() {
     local container_name=$1
@@ -253,90 +235,245 @@ wait_for_postgres_healthy() {
     return 1
 }
 
-# Deploy stacks by name list
-deploy_stacks_by_names() {
-    local portainer_url=$1
-    local token=$2
-    local endpoint_id=$3
-    local stacks=$4
-    shift 4
-    local stack_names=("$@")
+# Wait for Ducks API to be available
+wait_for_ducks_api() {
+    local max_wait=${1:-120}
+    local waited=0
+    local ducks_api="http://localhost:8700"
 
-    local deployed=0
+    log "Waiting for Ducks API to be available..."
 
-    for name in "${stack_names[@]}"; do
-        local stack_id=$(echo "$stacks" | jq -r ".[] | select(.Name==\"$name\") | .Id")
-
-        if [[ -z "$stack_id" ]]; then
-            warn "Stack not found: $name"
-            continue
-        fi
-
-        # Create networks first
-        create_stack_networks "$portainer_url" "$token" "$stack_id" "$name"
-
-        log "Deploying: $name..."
-        if portainer_redeploy_stack "$portainer_url" "$token" "$stack_id" "$endpoint_id"; then
-            success "  $name deployed"
-            deployed=$((deployed + 1))
-        else
-            error "  Failed to deploy $name"
+    while [[ $waited -lt $max_wait ]]; do
+        if curl -s "${ducks_api}/health" &>/dev/null; then
+            success "Ducks API is available!"
+            return 0
         fi
 
         sleep 3
+        waited=$((waited + 3))
+        echo -n "."
     done
 
-    return $deployed
+    echo ""
+    warn "Timeout waiting for Ducks API"
+    return 1
 }
 
-# Deploy remaining stacks (excluding already deployed ones)
-deploy_remaining_stacks() {
+# Deploy a single stack by name via Portainer
+deploy_stack_by_name() {
     local portainer_url=$1
     local token=$2
     local endpoint_id=$3
     local stacks=$4
-    shift 4
-    local exclude_names=("$@")
+    local stack_name=$5
 
-    local deployed=0
+    local stack_id=$(echo "$stacks" | jq -r ".[] | select(.Name==\"$stack_name\") | .Id")
 
-    for stack_id in $(echo "$stacks" | jq -r '.[].Id'); do
-        local stack_name=$(echo "$stacks" | jq -r ".[] | select(.Id==$stack_id) | .Name")
+    if [[ -z "$stack_id" ]]; then
+        warn "Stack not found: $stack_name"
+        return 1
+    fi
 
-        # Skip if in exclude list
+    # Create networks first
+    create_stack_networks "$portainer_url" "$token" "$stack_id" "$stack_name"
+
+    log "Deploying: $stack_name..."
+    if portainer_redeploy_stack "$portainer_url" "$token" "$stack_id" "$endpoint_id"; then
+        success "  $stack_name deployed"
+        return 0
+    else
+        error "  Failed to deploy $stack_name"
+        return 1
+    fi
+}
+
+# Deploy project via Ducks API
+deploy_via_ducks_api() {
+    local project_name=$1
+    local ducks_api="http://localhost:8700"
+
+    log "Deploying $project_name via Ducks API..."
+
+    # Get project ID
+    local project_id=$(curl -s "${ducks_api}/api/projects" 2>/dev/null | jq -r ".[] | select(.name==\"$project_name\") | .id // empty")
+
+    if [[ -z "$project_id" ]]; then
+        warn "Project $project_name not found in Ducks API"
+        return 1
+    fi
+
+    # Trigger deploy
+    local response=$(curl -s -X POST "${ducks_api}/api/projects/${project_id}/deploy" 2>/dev/null)
+    local error=$(echo "$response" | jq -r '.error // empty' 2>/dev/null)
+
+    if [[ -n "$error" ]]; then
+        warn "Failed to deploy $project_name: $error"
+        return 1
+    fi
+
+    success "  $project_name deploy triggered"
+    return 0
+}
+
+# Get all project names from Ducks API
+get_ducks_projects() {
+    local ducks_api="http://localhost:8700"
+    curl -s "${ducks_api}/api/projects" 2>/dev/null | jq -r '.[].name' 2>/dev/null
+}
+
+# Restore database for a specific container
+restore_single_database() {
+    local manifest_file=$1
+    local data_dir=$2
+    local target_container=$3
+
+    local containers=$(jq -r '.containers[] | @base64' "$manifest_file")
+
+    for container_b64 in $containers; do
+        local container=$(echo "$container_b64" | base64 -d)
+        local name=$(echo "$container" | jq -r '.container_name')
+
+        # Skip if not the target container
+        if [[ "$name" != *"$target_container"* ]]; then
+            continue
+        fi
+
+        local db_type=$(echo "$container" | jq -r '.db_type // empty')
+        local db_dump_file=$(echo "$container" | jq -r '.db_dump_file // empty')
+        local status=$(echo "$container" | jq -r '.status')
+
+        if [[ -z "$db_type" || -z "$db_dump_file" || "$status" != "success" ]]; then
+            continue
+        fi
+
+        local dump_path="$data_dir/$name/$db_dump_file"
+
+        if [[ ! -f "$dump_path" ]]; then
+            warn "Database dump not found: $dump_path"
+            continue
+        fi
+
+        # Wait for container to be ready
+        if ! wait_for_container "$name" 60; then
+            warn "Container $name not ready, skipping database restore"
+            continue
+        fi
+
+        sleep 5
+
+        case $db_type in
+            postgres)
+                restore_postgres "$name" "$dump_path"
+                ;;
+            mysql)
+                restore_mysql "$name" "$dump_path"
+                ;;
+            mariadb)
+                restore_mysql "$name" "$dump_path" "mysql" true
+                ;;
+            mongodb)
+                restore_mongodb "$name" "$dump_path"
+                ;;
+        esac
+
+        return 0
+    done
+
+    warn "No database found for container matching: $target_container"
+    return 1
+}
+
+# Restore all databases EXCEPT the ones already restored
+restore_remaining_databases() {
+    local manifest_file=$1
+    local data_dir=$2
+    shift 2
+    local exclude_patterns=("$@")
+
+    local containers=$(jq -r '.containers[] | @base64' "$manifest_file")
+    local restored=0
+
+    for container_b64 in $containers; do
+        local container=$(echo "$container_b64" | base64 -d)
+        local name=$(echo "$container" | jq -r '.container_name')
+        local db_type=$(echo "$container" | jq -r '.db_type // empty')
+        local db_dump_file=$(echo "$container" | jq -r '.db_dump_file // empty')
+        local status=$(echo "$container" | jq -r '.status')
+
+        # Skip if no database or failed
+        if [[ -z "$db_type" || -z "$db_dump_file" || "$status" != "success" ]]; then
+            continue
+        fi
+
+        # Skip if matches any exclude pattern
         local skip=false
-        for exclude in "${exclude_names[@]}"; do
-            if [[ "$stack_name" == "$exclude" ]]; then
+        for pattern in "${exclude_patterns[@]}"; do
+            if [[ "$name" == *"$pattern"* ]]; then
                 skip=true
                 break
             fi
         done
 
         if [[ "$skip" == "true" ]]; then
+            log "Skipping already restored: $name"
             continue
         fi
 
-        # Create networks first
-        create_stack_networks "$portainer_url" "$token" "$stack_id" "$stack_name"
+        local dump_path="$data_dir/$name/$db_dump_file"
 
-        log "Deploying: $stack_name..."
-        if portainer_redeploy_stack "$portainer_url" "$token" "$stack_id" "$endpoint_id"; then
-            success "  $stack_name deployed"
-            deployed=$((deployed + 1))
+        if [[ ! -f "$dump_path" ]]; then
+            warn "Database dump not found: $dump_path"
+            continue
         fi
 
-        sleep 3
+        # Wait for container to be ready
+        if ! wait_for_container "$name" 60; then
+            warn "Container $name not ready, skipping database restore"
+            continue
+        fi
+
+        sleep 5
+
+        case $db_type in
+            postgres)
+                restore_postgres "$name" "$dump_path"
+                restored=$((restored + 1))
+                ;;
+            mysql)
+                restore_mysql "$name" "$dump_path"
+                restored=$((restored + 1))
+                ;;
+            mariadb)
+                restore_mysql "$name" "$dump_path" "mysql" true
+                restored=$((restored + 1))
+                ;;
+            mongodb)
+                restore_mongodb "$name" "$dump_path"
+                restored=$((restored + 1))
+                ;;
+        esac
     done
 
-    return $deployed
+    if [[ $restored -gt 0 ]]; then
+        success "Restored $restored remaining database(s)"
+    else
+        log "No remaining databases to restore"
+    fi
 }
 
-# NEW PHASED DEPLOYMENT FLOW
-# Phase 1: Deploy alexandria + ducks-ecosystem
-# Phase 2: Wait for PostgreSQL healthy
-# Phase 3: Restore database dumps
-# Phase 4: Deploy argos via Ducks API
-# Phase 5: Deploy remaining stacks
+# ============================================
+# MAIN PHASED DEPLOYMENT FLOW
+# ============================================
+# 1. Portainer (already done before this)
+# 2. Volumes (already done, skips databases)
+# 3. Deploy alexandria
+# 4. Deploy ducks-ecosystem
+# 5. pg_restore ONLY ducks-ecosystem
+# 6. Via Ducks API: deploy argos
+# 7. Via Ducks API: deploy remaining projects
+# 8. pg_restore ALL remaining databases
+# ============================================
+
 phased_redeploy() {
     local portainer_url=${1:-"https://localhost:9443"}
     local manifest_file=$2
@@ -347,14 +484,16 @@ phased_redeploy() {
     log "   PHASED STACK DEPLOYMENT"
     log "============================================"
     echo ""
-    log "Phase 1: Deploy infrastructure (alexandria, ducks-ecosystem)"
-    log "Phase 2: Wait for databases to be healthy"
-    log "Phase 3: Restore database dumps"
-    log "Phase 4: Deploy argos via Ducks API"
-    log "Phase 5: Deploy remaining stacks"
+    log "Flow:"
+    log "  1. Deploy alexandria (via Portainer)"
+    log "  2. Deploy ducks-ecosystem (via Portainer)"
+    log "  3. pg_restore ducks-ecosystem database"
+    log "  4. Deploy argos (via Ducks API)"
+    log "  5. Deploy remaining projects (via Ducks API)"
+    log "  6. pg_restore all remaining databases"
     echo ""
 
-    # Ask for credentials
+    # Ask for Portainer credentials
     read -p "Portainer username: " PORTAINER_USER
     read -sp "Portainer password: " PORTAINER_PASS
     echo ""
@@ -364,7 +503,7 @@ phased_redeploy() {
         return 1
     fi
 
-    # Authenticate
+    # Authenticate with Portainer
     log "Authenticating with Portainer..."
     local token=$(portainer_authenticate "$portainer_url" "$PORTAINER_USER" "$PORTAINER_PASS")
 
@@ -393,34 +532,33 @@ phased_redeploy() {
     fi
 
     log "Found $stack_count stack(s)"
-    echo ""
 
     # ============================================
-    # PHASE 1: Deploy alexandria + ducks-ecosystem
+    # PHASE 1: Deploy alexandria
     # ============================================
     echo ""
     log "============================================"
-    log "   PHASE 1: Infrastructure Stacks"
+    log "   PHASE 1: Deploy Alexandria"
     log "============================================"
     echo ""
 
-    deploy_stacks_by_names "$portainer_url" "$token" "$endpoint_id" "$stacks" "alexandria" "ducks-ecosystem"
+    deploy_stack_by_name "$portainer_url" "$token" "$endpoint_id" "$stacks" "alexandria"
+    sleep 5
 
-    # Wait for containers to start
+    # ============================================
+    # PHASE 2: Deploy ducks-ecosystem
+    # ============================================
+    echo ""
+    log "============================================"
+    log "   PHASE 2: Deploy Ducks-Ecosystem"
+    log "============================================"
+    echo ""
+
+    deploy_stack_by_name "$portainer_url" "$token" "$endpoint_id" "$stacks" "ducks-ecosystem"
     sleep 10
 
-    # ============================================
-    # PHASE 2: Wait for PostgreSQL to be healthy
-    # ============================================
-    echo ""
-    log "============================================"
-    log "   PHASE 2: Wait for Databases"
-    log "============================================"
-    echo ""
-
-    # Find postgres container from ducks-ecosystem
+    # Wait for PostgreSQL to be healthy
     local pg_container=$(docker ps --format '{{.Names}}' | grep -E 'ducks-ecosystem.*postgres' | head -1)
-
     if [[ -n "$pg_container" ]]; then
         wait_for_postgres_healthy "$pg_container" 120
     else
@@ -429,67 +567,86 @@ phased_redeploy() {
     fi
 
     # ============================================
-    # PHASE 3: Restore database dumps
+    # PHASE 3: pg_restore ONLY ducks-ecosystem
     # ============================================
     echo ""
     log "============================================"
-    log "   PHASE 3: Restore Database Dumps"
+    log "   PHASE 3: Restore Ducks-Ecosystem Database"
     log "============================================"
     echo ""
 
     if [[ -n "$manifest_file" ]] && [[ -n "$data_dir" ]]; then
-        restore_databases_from_manifest "$manifest_file" "$data_dir" ""
+        restore_single_database "$manifest_file" "$data_dir" "ducks-ecosystem"
     else
         warn "No manifest/data provided, skipping database restore"
     fi
+
+    # Wait for Ducks API to come up
+    wait_for_ducks_api 120
 
     # ============================================
     # PHASE 4: Deploy argos via Ducks API
     # ============================================
     echo ""
     log "============================================"
-    log "   PHASE 4: Deploy Argos"
+    log "   PHASE 4: Deploy Argos (via Ducks API)"
     log "============================================"
     echo ""
 
-    # Try via Ducks API first (if ducks-ecosystem is running)
-    local ducks_api="http://localhost:8700"
+    deploy_via_ducks_api "argos"
+    sleep 15
 
-    # Check if Ducks API is available
-    if curl -s "${ducks_api}/health" &>/dev/null; then
-        log "Ducks API is available, deploying argos via API..."
+    # ============================================
+    # PHASE 5: Deploy remaining projects via Ducks API
+    # ============================================
+    echo ""
+    log "============================================"
+    log "   PHASE 5: Deploy Remaining Projects"
+    log "============================================"
+    echo ""
 
-        # Get argos project ID
-        local argos_project=$(curl -s "${ducks_api}/api/projects" 2>/dev/null | jq -r '.[] | select(.name=="argos") | .id // empty')
+    # Get all projects from Ducks and deploy them
+    local projects=$(get_ducks_projects)
+    local skip_projects=("alexandria" "ducks-ecosystem" "argos")
 
-        if [[ -n "$argos_project" ]]; then
-            log "Found argos project: $argos_project"
-            # Trigger deploy via Ducks API
-            curl -s -X POST "${ducks_api}/api/projects/${argos_project}/deploy" &>/dev/null || true
-            success "Argos deploy triggered via Ducks API"
-        else
-            warn "Argos project not found in Ducks, deploying via Portainer..."
-            deploy_stacks_by_names "$portainer_url" "$token" "$endpoint_id" "$stacks" "argos"
+    for project in $projects; do
+        # Skip already deployed
+        local skip=false
+        for skip_name in "${skip_projects[@]}"; do
+            if [[ "$project" == "$skip_name" ]]; then
+                skip=true
+                break
+            fi
+        done
+
+        if [[ "$skip" == "true" ]]; then
+            continue
         fi
-    else
-        log "Ducks API not available, deploying argos via Portainer..."
-        deploy_stacks_by_names "$portainer_url" "$token" "$endpoint_id" "$stacks" "argos"
+
+        deploy_via_ducks_api "$project"
+        sleep 5
+    done
+
+    # Wait for containers to start
+    log "Waiting for all containers to start..."
+    sleep 20
+
+    # ============================================
+    # PHASE 6: pg_restore ALL remaining databases
+    # ============================================
+    echo ""
+    log "============================================"
+    log "   PHASE 6: Restore Remaining Databases"
+    log "============================================"
+    echo ""
+
+    if [[ -n "$manifest_file" ]] && [[ -n "$data_dir" ]]; then
+        restore_remaining_databases "$manifest_file" "$data_dir" "ducks-ecosystem"
     fi
 
-    sleep 10
-
     # ============================================
-    # PHASE 5: Deploy remaining stacks
+    # DONE
     # ============================================
-    echo ""
-    log "============================================"
-    log "   PHASE 5: Remaining Stacks"
-    log "============================================"
-    echo ""
-
-    deploy_remaining_stacks "$portainer_url" "$token" "$endpoint_id" "$stacks" "alexandria" "ducks-ecosystem" "argos"
-
-    # Final summary
     echo ""
     log "============================================"
     success "   DEPLOYMENT COMPLETE!"
@@ -499,12 +656,11 @@ phased_redeploy() {
     return 0
 }
 
-# Keep old function for backwards compatibility
+# Backwards compatibility
 redeploy_portainer_stacks() {
     local portainer_url=${1:-"https://localhost:9443"}
     local manifest_file=$2
     local data_dir=$3
 
-    # Use new phased deployment
     phased_redeploy "$portainer_url" "$manifest_file" "$data_dir"
 }
