@@ -75,6 +75,16 @@ restore_volumes_from_manifest() {
             continue
         fi
 
+        # Check if this is a database container with a dump file
+        local db_type=$(echo "$container" | jq -r '.db_type // empty')
+        local db_dump_file=$(echo "$container" | jq -r '.db_dump_file // empty')
+
+        # Skip volume restore for database containers - they will be restored via pg_restore/mysql
+        if [[ -n "$db_type" && -n "$db_dump_file" ]]; then
+            warn "Skipping volume for database: $name (will restore via dump)"
+            continue
+        fi
+
         log "Processing container: $name"
 
         # Get volume files
