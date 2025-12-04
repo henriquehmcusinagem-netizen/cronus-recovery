@@ -196,11 +196,21 @@ main() {
     log "Restoring volumes..."
     restore_volumes_from_manifest "$MANIFEST_FILE" "$TEMP_DIR/data" "$CONTAINER_FILTER"
 
-    # Step 4: Start containers
+    # Step 4: Start containers and restore databases (phased deployment)
     if [[ "$SKIP_COMPOSE" != "true" ]]; then
         if [[ "$PORTAINER_INCLUDED" == "true" ]] && [[ "$SKIP_PORTAINER" != "true" ]]; then
-            # Auto-redeploy all stacks via Portainer API
-            redeploy_portainer_stacks "https://localhost:9443"
+            # Phased deployment:
+            # 1. Deploy alexandria + ducks-ecosystem
+            # 2. Wait for PostgreSQL healthy
+            # 3. Restore database dumps
+            # 4. Deploy argos via Ducks API
+            # 5. Deploy remaining stacks
+            if [[ "$SKIP_DATABASES" == "true" ]]; then
+                # Skip database restore - pass empty paths
+                redeploy_portainer_stacks "https://localhost:9443" "" ""
+            else
+                redeploy_portainer_stacks "https://localhost:9443" "$MANIFEST_FILE" "$TEMP_DIR/data"
+            fi
         else
             COMPOSE_FILE="$TEMP_DIR/docker-compose.yml"
             if [[ -f "$COMPOSE_FILE" ]]; then
@@ -215,20 +225,18 @@ main() {
             else
                 warn "docker-compose.yml not found, skipping container startup"
             fi
+
+            # Non-Portainer mode: restore databases separately
+            if [[ "$SKIP_DATABASES" != "true" ]]; then
+                log "Waiting for database containers to be ready..."
+                sleep 10
+
+                log "Restoring databases..."
+                restore_databases_from_manifest "$MANIFEST_FILE" "$TEMP_DIR/data" "$CONTAINER_FILTER"
+            fi
         fi
     else
         warn "Skipping docker-compose up"
-    fi
-
-    # Step 5: Wait for database containers and restore
-    if [[ "$SKIP_DATABASES" != "true" ]]; then
-        log "Waiting for database containers to be ready..."
-        sleep 10
-
-        log "Restoring databases..."
-        restore_databases_from_manifest "$MANIFEST_FILE" "$TEMP_DIR/data" "$CONTAINER_FILTER"
-    else
-        warn "Skipping database restoration"
     fi
 
     # Final summary

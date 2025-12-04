@@ -170,28 +170,6 @@ portainer_redeploy_stack() {
     return 0
 }
 
-# Priority order for stack deployment
-# 1st: alexandria (base infrastructure)
-# 2nd: ducks-ecosystem (depends on alexandria)
-# 3rd: argos (secrets manager)
-# Rest: no specific order
-STACK_PRIORITY_ORDER=("alexandria" "ducks-ecosystem" "argos")
-
-# Get stack priority (lower = higher priority)
-get_stack_priority() {
-    local stack_name=$1
-    local priority=999
-
-    for i in "${!STACK_PRIORITY_ORDER[@]}"; do
-        if [[ "${STACK_PRIORITY_ORDER[$i]}" == "$stack_name" ]]; then
-            priority=$i
-            break
-        fi
-    done
-
-    echo $priority
-}
-
 # Create networks for a stack before deploying
 create_stack_networks() {
     local portainer_url=$1
@@ -208,7 +186,6 @@ create_stack_networks() {
     fi
 
     # Extract network names from the stack file
-    # Look for networks defined in the file
     local networks=$(echo "$stack_file" | grep -E "^\s+[a-zA-Z0-9_-]+-network:" | sed 's/://g' | awk '{print $1}')
 
     for network in $networks; do
@@ -217,7 +194,6 @@ create_stack_networks() {
         # Check if network exists
         if ! docker network inspect "$full_network_name" &>/dev/null; then
             log "  Creating network: $full_network_name"
-            # Create with docker-compose labels so Portainer recognizes it
             docker network create \
                 --label "com.docker.compose.network=${network}" \
                 --label "com.docker.compose.project=${stack_name}" \
@@ -245,49 +221,137 @@ create_all_stack_networks() {
     echo ""
 }
 
-# Sort stacks by priority
-sort_stacks_by_priority() {
-    local stacks=$1
-    local sorted_ids=""
+# Wait for PostgreSQL container to be healthy
+wait_for_postgres_healthy() {
+    local container_name=$1
+    local max_wait=${2:-120}
+    local waited=0
 
-    # First, add priority stacks in order
-    for priority_name in "${STACK_PRIORITY_ORDER[@]}"; do
-        local stack_id=$(echo "$stacks" | jq -r ".[] | select(.Name==\"$priority_name\") | .Id")
-        if [[ -n "$stack_id" ]]; then
-            sorted_ids="$sorted_ids $stack_id"
+    log "Waiting for PostgreSQL ($container_name) to be healthy..."
+
+    while [[ $waited -lt $max_wait ]]; do
+        local health=$(docker inspect --format='{{.State.Health.Status}}' "$container_name" 2>/dev/null)
+
+        if [[ "$health" == "healthy" ]]; then
+            success "PostgreSQL is healthy!"
+            return 0
         fi
+
+        # Also check if it can accept connections
+        if docker exec "$container_name" pg_isready -U postgres &>/dev/null; then
+            success "PostgreSQL is ready (pg_isready)!"
+            return 0
+        fi
+
+        sleep 3
+        waited=$((waited + 3))
+        echo -n "."
     done
 
-    # Then add the rest
+    echo ""
+    warn "Timeout waiting for PostgreSQL to be healthy"
+    return 1
+}
+
+# Deploy stacks by name list
+deploy_stacks_by_names() {
+    local portainer_url=$1
+    local token=$2
+    local endpoint_id=$3
+    local stacks=$4
+    shift 4
+    local stack_names=("$@")
+
+    local deployed=0
+
+    for name in "${stack_names[@]}"; do
+        local stack_id=$(echo "$stacks" | jq -r ".[] | select(.Name==\"$name\") | .Id")
+
+        if [[ -z "$stack_id" ]]; then
+            warn "Stack not found: $name"
+            continue
+        fi
+
+        # Create networks first
+        create_stack_networks "$portainer_url" "$token" "$stack_id" "$name"
+
+        log "Deploying: $name..."
+        if portainer_redeploy_stack "$portainer_url" "$token" "$stack_id" "$endpoint_id"; then
+            success "  $name deployed"
+            deployed=$((deployed + 1))
+        else
+            error "  Failed to deploy $name"
+        fi
+
+        sleep 3
+    done
+
+    return $deployed
+}
+
+# Deploy remaining stacks (excluding already deployed ones)
+deploy_remaining_stacks() {
+    local portainer_url=$1
+    local token=$2
+    local endpoint_id=$3
+    local stacks=$4
+    shift 4
+    local exclude_names=("$@")
+
+    local deployed=0
+
     for stack_id in $(echo "$stacks" | jq -r '.[].Id'); do
         local stack_name=$(echo "$stacks" | jq -r ".[] | select(.Id==$stack_id) | .Name")
-        local is_priority=false
 
-        for priority_name in "${STACK_PRIORITY_ORDER[@]}"; do
-            if [[ "$stack_name" == "$priority_name" ]]; then
-                is_priority=true
+        # Skip if in exclude list
+        local skip=false
+        for exclude in "${exclude_names[@]}"; do
+            if [[ "$stack_name" == "$exclude" ]]; then
+                skip=true
                 break
             fi
         done
 
-        if [[ "$is_priority" == "false" ]]; then
-            sorted_ids="$sorted_ids $stack_id"
+        if [[ "$skip" == "true" ]]; then
+            continue
         fi
+
+        # Create networks first
+        create_stack_networks "$portainer_url" "$token" "$stack_id" "$stack_name"
+
+        log "Deploying: $stack_name..."
+        if portainer_redeploy_stack "$portainer_url" "$token" "$stack_id" "$endpoint_id"; then
+            success "  $stack_name deployed"
+            deployed=$((deployed + 1))
+        fi
+
+        sleep 3
     done
 
-    echo $sorted_ids
+    return $deployed
 }
 
-# Redeploy all stacks in Portainer (via API)
-redeploy_portainer_stacks() {
+# NEW PHASED DEPLOYMENT FLOW
+# Phase 1: Deploy alexandria + ducks-ecosystem
+# Phase 2: Wait for PostgreSQL healthy
+# Phase 3: Restore database dumps
+# Phase 4: Deploy argos via Ducks API
+# Phase 5: Deploy remaining stacks
+phased_redeploy() {
     local portainer_url=${1:-"https://localhost:9443"}
+    local manifest_file=$2
+    local data_dir=$3
 
     echo ""
     log "============================================"
-    log "   AUTO-REDEPLOY STACKS"
+    log "   PHASED STACK DEPLOYMENT"
     log "============================================"
     echo ""
-    log "To automatically redeploy all stacks, enter your Portainer credentials."
+    log "Phase 1: Deploy infrastructure (alexandria, ducks-ecosystem)"
+    log "Phase 2: Wait for databases to be healthy"
+    log "Phase 3: Restore database dumps"
+    log "Phase 4: Deploy argos via Ducks API"
+    log "Phase 5: Deploy remaining stacks"
     echo ""
 
     # Ask for credentials
@@ -296,8 +360,7 @@ redeploy_portainer_stacks() {
     echo ""
 
     if [[ -z "$PORTAINER_USER" ]] || [[ -z "$PORTAINER_PASS" ]]; then
-        warn "No credentials provided, skipping auto-redeploy"
-        log "You can manually redeploy stacks at: $portainer_url"
+        warn "No credentials provided, aborting"
         return 1
     fi
 
@@ -307,7 +370,6 @@ redeploy_portainer_stacks() {
 
     if [[ -z "$token" ]]; then
         error "Authentication failed. Check your credentials."
-        log "You can manually redeploy stacks at: $portainer_url"
         return 1
     fi
 
@@ -326,47 +388,123 @@ redeploy_portainer_stacks() {
     local stack_count=$(echo "$stacks" | jq 'length' 2>/dev/null)
 
     if [[ -z "$stack_count" ]] || [[ "$stack_count" == "0" ]]; then
-        warn "No stacks found to redeploy"
+        warn "No stacks found"
         return 0
     fi
 
-    log "Found $stack_count stack(s) to redeploy"
+    log "Found $stack_count stack(s)"
     echo ""
 
-    # Step 1: Create all networks first
-    create_all_stack_networks "$portainer_url" "$token" "$stacks"
-
-    # Step 2: Sort stacks by priority
-    log "Deploy order: alexandria -> ducks-ecosystem -> argos -> others"
+    # ============================================
+    # PHASE 1: Deploy alexandria + ducks-ecosystem
+    # ============================================
+    echo ""
+    log "============================================"
+    log "   PHASE 1: Infrastructure Stacks"
+    log "============================================"
     echo ""
 
-    local sorted_stack_ids=$(sort_stacks_by_priority "$stacks")
+    deploy_stacks_by_names "$portainer_url" "$token" "$endpoint_id" "$stacks" "alexandria" "ducks-ecosystem"
 
-    # Step 3: Redeploy each stack in order
-    local success_count=0
-    local fail_count=0
+    # Wait for containers to start
+    sleep 10
 
-    for stack_id in $sorted_stack_ids; do
-        local stack_name=$(echo "$stacks" | jq -r ".[] | select(.Id==$stack_id) | .Name")
-        log "Redeploying: $stack_name..."
-
-        if portainer_redeploy_stack "$portainer_url" "$token" "$stack_id" "$endpoint_id"; then
-            success "  $stack_name redeployed"
-            success_count=$((success_count + 1))
-        else
-            fail_count=$((fail_count + 1))
-        fi
-
-        # Wait for containers to start before next deployment
-        sleep 5
-    done
-
+    # ============================================
+    # PHASE 2: Wait for PostgreSQL to be healthy
+    # ============================================
     echo ""
-    log "Redeploy complete: $success_count succeeded, $fail_count failed"
+    log "============================================"
+    log "   PHASE 2: Wait for Databases"
+    log "============================================"
+    echo ""
 
-    if [[ $fail_count -gt 0 ]]; then
-        warn "Some stacks failed. Check Portainer UI: $portainer_url"
+    # Find postgres container from ducks-ecosystem
+    local pg_container=$(docker ps --format '{{.Names}}' | grep -E 'ducks-ecosystem.*postgres' | head -1)
+
+    if [[ -n "$pg_container" ]]; then
+        wait_for_postgres_healthy "$pg_container" 120
+    else
+        warn "PostgreSQL container not found, waiting 30s..."
+        sleep 30
     fi
 
+    # ============================================
+    # PHASE 3: Restore database dumps
+    # ============================================
+    echo ""
+    log "============================================"
+    log "   PHASE 3: Restore Database Dumps"
+    log "============================================"
+    echo ""
+
+    if [[ -n "$manifest_file" ]] && [[ -n "$data_dir" ]]; then
+        restore_databases_from_manifest "$manifest_file" "$data_dir" ""
+    else
+        warn "No manifest/data provided, skipping database restore"
+    fi
+
+    # ============================================
+    # PHASE 4: Deploy argos via Ducks API
+    # ============================================
+    echo ""
+    log "============================================"
+    log "   PHASE 4: Deploy Argos"
+    log "============================================"
+    echo ""
+
+    # Try via Ducks API first (if ducks-ecosystem is running)
+    local ducks_api="http://localhost:8700"
+
+    # Check if Ducks API is available
+    if curl -s "${ducks_api}/health" &>/dev/null; then
+        log "Ducks API is available, deploying argos via API..."
+
+        # Get argos project ID
+        local argos_project=$(curl -s "${ducks_api}/api/projects" 2>/dev/null | jq -r '.[] | select(.name=="argos") | .id // empty')
+
+        if [[ -n "$argos_project" ]]; then
+            log "Found argos project: $argos_project"
+            # Trigger deploy via Ducks API
+            curl -s -X POST "${ducks_api}/api/projects/${argos_project}/deploy" &>/dev/null || true
+            success "Argos deploy triggered via Ducks API"
+        else
+            warn "Argos project not found in Ducks, deploying via Portainer..."
+            deploy_stacks_by_names "$portainer_url" "$token" "$endpoint_id" "$stacks" "argos"
+        fi
+    else
+        log "Ducks API not available, deploying argos via Portainer..."
+        deploy_stacks_by_names "$portainer_url" "$token" "$endpoint_id" "$stacks" "argos"
+    fi
+
+    sleep 10
+
+    # ============================================
+    # PHASE 5: Deploy remaining stacks
+    # ============================================
+    echo ""
+    log "============================================"
+    log "   PHASE 5: Remaining Stacks"
+    log "============================================"
+    echo ""
+
+    deploy_remaining_stacks "$portainer_url" "$token" "$endpoint_id" "$stacks" "alexandria" "ducks-ecosystem" "argos"
+
+    # Final summary
+    echo ""
+    log "============================================"
+    success "   DEPLOYMENT COMPLETE!"
+    log "============================================"
+    echo ""
+
     return 0
+}
+
+# Keep old function for backwards compatibility
+redeploy_portainer_stacks() {
+    local portainer_url=${1:-"https://localhost:9443"}
+    local manifest_file=$2
+    local data_dir=$3
+
+    # Use new phased deployment
+    phased_redeploy "$portainer_url" "$manifest_file" "$data_dir"
 }
