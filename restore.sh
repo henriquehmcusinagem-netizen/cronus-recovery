@@ -6,9 +6,10 @@
 # Usage: ./restore.sh <backup.tar.gz> [options]
 #
 # Options:
-#   --skip-networks     Don't create Docker networks
+#   --skip-networks     Do not create Docker networks
 #   --skip-databases    Skip database restoration
-#   --skip-compose      Don't run docker-compose up
+#   --skip-compose      Do not run docker-compose up
+#   --skip-portainer    Skip Portainer restoration
 #   --dry-run           Show what would be done without executing
 #   --container NAME    Restore only specific container
 #   -h, --help          Show this help message
@@ -32,11 +33,13 @@ source "$SCRIPT_DIR/lib/docker.sh"
 source "$SCRIPT_DIR/lib/network.sh"
 source "$SCRIPT_DIR/lib/volume.sh"
 source "$SCRIPT_DIR/lib/database.sh"
+source "$SCRIPT_DIR/lib/portainer.sh"
 
 # Default options
 SKIP_NETWORKS=false
 SKIP_DATABASES=false
 SKIP_COMPOSE=false
+SKIP_PORTAINER=false
 DRY_RUN=false
 CONTAINER_FILTER=""
 
@@ -54,6 +57,10 @@ parse_args() {
                 ;;
             --skip-compose)
                 SKIP_COMPOSE=true
+                shift
+                ;;
+            --skip-portainer)
+                SKIP_PORTAINER=true
                 shift
                 ;;
             --dry-run)
@@ -87,9 +94,10 @@ show_help() {
     echo "Usage: ./restore.sh <backup.tar.gz> [options]"
     echo ""
     echo "Options:"
-    echo "  --skip-networks     Don't create Docker networks"
+    echo "  --skip-networks     Do not create Docker networks"
     echo "  --skip-databases    Skip database restoration"
-    echo "  --skip-compose      Don't run docker-compose up"
+    echo "  --skip-compose      Do not run docker-compose up"
+    echo "  --skip-portainer    Skip Portainer restoration"
     echo "  --dry-run           Show what would be done without executing"
     echo "  --container NAME    Restore only specific container"
     echo "  -h, --help          Show this help message"
@@ -140,63 +148,96 @@ main() {
     BACKUP_ID=$(jq -r '.id' "$MANIFEST_FILE")
     BACKUP_NAME=$(jq -r '.name // "Unnamed"' "$MANIFEST_FILE")
     TOTAL_CONTAINERS=$(jq -r '.summary.total_containers' "$MANIFEST_FILE")
+    PORTAINER_INCLUDED=$(jq -r '.portainer_backup_included // false' "$MANIFEST_FILE")
 
     log "Backup ID: $BACKUP_ID"
     log "Backup Name: $BACKUP_NAME"
     log "Total Containers: $TOTAL_CONTAINERS"
+    log "Portainer Backup: $PORTAINER_INCLUDED"
 
     if [[ "$DRY_RUN" == "true" ]]; then
         warn "[DRY RUN] Would restore the following:"
         echo ""
-        echo "Boot order (infrastructure and databases first):"
-        jq -r '.restoration.boot_order[]? // empty' "$MANIFEST_FILE" | nl
+        if [[ "$PORTAINER_INCLUDED" == "true" ]]; then
+            echo "Portainer: Will be restored automatically"
+        fi
         echo ""
         echo "Containers:"
-        jq -r '.containers | sort_by(.boot_priority) | .[] | "  [\(.boot_priority)] \(.container_name) (\(.image))"' "$MANIFEST_FILE"
+        jq -r '.containers[] | "  \(.container_name) (\(.image))"' "$MANIFEST_FILE" 2>/dev/null || true
         echo ""
-        echo "Networks:"
-        jq -r '.networks[]? | "  - \(.name) (\(.driver))"' "$MANIFEST_FILE"
         exit 0
     fi
 
-    # Step 1: Create networks
+    # Step 1: Restore Portainer (if backup exists)
+    if [[ "$SKIP_PORTAINER" != "true" ]]; then
+        if portainer_backup_exists "$TEMP_DIR"; then
+            echo ""
+            log "============================================"
+            log "   RESTORING PORTAINER"
+            log "============================================"
+            restore_portainer "$TEMP_DIR"
+            echo ""
+        else
+            warn "No Portainer backup found in archive"
+        fi
+    else
+        warn "Skipping Portainer restoration"
+    fi
+
+    # Step 2: Create networks
     if [[ "$SKIP_NETWORKS" != "true" ]]; then
         log "Creating Docker networks..."
-        create_networks_from_manifest "$MANIFEST_FILE"
+        create_networks_from_manifest "$MANIFEST_FILE" 2>/dev/null || true
     else
         warn "Skipping network creation"
     fi
 
-    # Step 2: Create volumes and restore data
+    # Step 3: Create volumes and restore data
     log "Restoring volumes..."
     restore_volumes_from_manifest "$MANIFEST_FILE" "$TEMP_DIR/data" "$CONTAINER_FILTER"
 
-    # Step 3: Start containers with docker-compose
+    # Step 4: Start containers
     if [[ "$SKIP_COMPOSE" != "true" ]]; then
-        COMPOSE_FILE="$TEMP_DIR/docker-compose.yml"
-        if [[ -f "$COMPOSE_FILE" ]]; then
-            log "Starting containers with docker-compose..."
-            cd "$TEMP_DIR"
-            # Try new docker compose first, fallback to old docker-compose
-            if docker compose version &> /dev/null; then
-                docker compose up -d
-            else
-                docker-compose up -d
-            fi
-            cd - > /dev/null
+        if [[ "$PORTAINER_INCLUDED" == "true" ]] && [[ "$SKIP_PORTAINER" != "true" ]]; then
+            echo ""
+            log "============================================"
+            log "   REDEPLOY STACKS IN PORTAINER"
+            log "============================================"
+            echo ""
+            log "Portainer has been restored with all your stacks."
+            log "Please go to Portainer UI and redeploy each stack:"
+            echo ""
+            echo "  1. Access https://localhost:9443 (or your server IP)"
+            echo "  2. Go to Stacks menu"
+            echo "  3. For each stack: click Update the stack"
+            echo ""
+            echo "This will start all containers using the restored volumes."
+            echo ""
+            read -p "Press Enter after you have redeployed all stacks..."
         else
-            warn "docker-compose.yml not found, skipping container startup"
+            COMPOSE_FILE="$TEMP_DIR/docker-compose.yml"
+            if [[ -f "$COMPOSE_FILE" ]]; then
+                log "Starting containers with docker-compose..."
+                cd "$TEMP_DIR"
+                if docker compose version &> /dev/null; then
+                    docker compose up -d
+                else
+                    docker-compose up -d
+                fi
+                cd - > /dev/null
+            else
+                warn "docker-compose.yml not found, skipping container startup"
+            fi
         fi
     else
         warn "Skipping docker-compose up"
     fi
 
-    # Step 4: Wait for database containers
+    # Step 5: Wait for database containers and restore
     if [[ "$SKIP_DATABASES" != "true" ]]; then
         log "Waiting for database containers to be ready..."
-        sleep 10  # Give containers time to start
+        sleep 10
 
-        # Restore databases
         log "Restoring databases..."
         restore_databases_from_manifest "$MANIFEST_FILE" "$TEMP_DIR/data" "$CONTAINER_FILTER"
     else
@@ -205,11 +246,19 @@ main() {
 
     # Final summary
     echo ""
-    success "Recovery complete!"
-    log "You may need to:"
-    echo "  - Verify all containers are running: docker ps"
-    echo "  - Check container logs: docker logs <container>"
-    echo "  - Update any external DNS/IP configurations"
+    log "============================================"
+    success "   RECOVERY COMPLETE!"
+    log "============================================"
+    echo ""
+    log "Next steps:"
+    echo "  1. Verify all containers are running: docker ps"
+    echo "  2. Check container logs: docker logs <container>"
+    echo "  3. Test your applications"
+    echo "  4. Update any external DNS/IP configurations"
+    echo ""
+    if [[ "$PORTAINER_INCLUDED" == "true" ]]; then
+        log "Portainer UI: https://localhost:9443"
+    fi
 }
 
 # Run main function
